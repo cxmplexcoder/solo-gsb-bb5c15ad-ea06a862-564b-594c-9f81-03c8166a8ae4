@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.weave import (  # noqa: E402
     DesignError,
+    FloatViolation,
+    aggregate_float_risk_zones,
     analyze_repeat_period,
     audit_floats,
     best_alignment,
@@ -19,6 +21,7 @@ from app.weave import (  # noqa: E402
     suggest_tie_up_flips,
     threshold_profile,
     validate_design,
+    violations_of_matrix,
     _proper_divisors,
     _runs,
 )
@@ -858,6 +861,204 @@ def test_loom_fit_random_properties():
     print("  ok: loom fit random property checks (200 cases)")
 
 
+def zone_cells(result):
+    return [[list(c) for c in z.cells] for z in result.zones]
+
+
+def test_risk_zones_no_violations():
+    matrix = [[1, 0], [0, 1]]
+    result = aggregate_float_risk_zones(matrix, [], False)
+    check(result.warp_ends == 2 and result.weft_picks == 2,
+          "risk zones echo matrix dimensions")
+    check(result.zones == [] and result.to_dict()["zone_count"] == 0,
+          "no violations -> empty zone list and zero count")
+
+
+def test_risk_zones_warp_weft_merge_mixed_direction():
+    # 3x3，max_float=1：
+    # 1 1 0
+    # 1 1 0
+    # 0 0 0
+    # 经向违规：列 0、列 1 各有长度 2 的连续 1（覆盖左上 2x2）；
+    # 纬向违规：行 2 有长度 3 的连续 0。两者在 (1,0)-(2,0)、
+    # (1,1)-(2,1) 处经纬相邻 -> 7 个单元合并为一个混合方向区域。
+    matrix = [[1, 1, 0], [1, 1, 0], [0, 0, 0]]
+    violations = violations_of_matrix(matrix, 1, False)
+    check(sorted((v.direction, v.yarn_index, v.start, v.length)
+                 for v in violations)
+          == [("warp", 0, 0, 2), ("warp", 1, 0, 2), ("weft", 2, 0, 3)],
+          "mixed matrix has two warp runs and one weft run")
+    result = aggregate_float_risk_zones(matrix, violations, False)
+    check(len(result.zones) == 1, "warp and weft runs merge across edges")
+    zone = result.zones[0]
+    check(zone.cells == [(0, 0), (0, 1), (1, 0), (1, 1),
+                         (2, 0), (2, 1), (2, 2)],
+          "mixed zone lists every flagged cell in row-major order")
+    check(zone.area == 7, "mixed zone area counts all seven cells")
+    check(zone.max_float == 3, "mixed zone max_float is the weft run length 3")
+    check(zone.directions == ["warp", "weft"],
+          "mixed zone directions deduplicated with warp first")
+    check((zone.min_row, zone.min_col, zone.max_row, zone.max_col)
+          == (0, 0, 2, 2), "mixed zone bbox wraps the 3x3 corner")
+    check(zone.max_row - zone.min_row + 1 == 3
+          and zone.max_col - zone.min_col + 1 == 3,
+          "mixed zone bbox size 3x3")
+    payload = result.to_dict()
+    check(payload["warp_ends"] == 3 and payload["weft_picks"] == 3
+          and payload["zone_count"] == 1
+          and payload["zones"][0]["cells"][0] == {"row": 0, "col": 0}
+          and payload["zones"][0]["bbox"] == {
+              "min_row": 0, "min_col": 0, "max_row": 2, "max_col": 2,
+              "rows": 3, "cols": 3},
+          "serialization payload has dimensions, count, cells and bbox")
+
+
+def test_risk_zones_diagonal_touch_not_merged():
+    # 3x3 上手工放置两条长度 3 的违规：列 0 的经浮长与行 2 的纬浮长
+    # 仅在 (2,0) 相接（真正共享该单元，必然合并）；
+    # 为构造纯对角接触，取列 0 经浮长 (0,0)(1,0)(2,0) 与
+    # 行 0 的纬浮长 (0,1)(0,2) 不接触……改为合成两条对角角点的违规：
+    # 经浮长覆盖 (0,0)，纬浮长覆盖 (1,1)：仅对角，不合并
+    matrix = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    violations = [
+        FloatViolation("warp", 0, 0, 1),
+        FloatViolation("weft", 1, 1, 1),
+    ]
+    result = aggregate_float_risk_zones(matrix, violations, False)
+    check(len(result.zones) == 2, "diagonal-only cells stay in two zones")
+    check([z.cells for z in result.zones] == [[(0, 0)], [(1, 1)]],
+          "equal severity tie broken by smallest cell (row then col)")
+    z0 = result.zones[0]
+    check(z0.max_row - z0.min_row + 1 == 1 and z0.max_col - z0.min_col + 1 == 1,
+          "single-cell zone bbox is 1x1")
+
+
+def test_risk_zones_severity_ordering():
+    matrix = [[0] * 7 for _ in range(7)]
+    # 三个互不相邻的单单元违规：验证同严重度（同 max_float、同面积）下
+    # 按最小单元坐标（行后列）升序的确定性平局
+    violations = [
+        FloatViolation("warp", 0, 0, 1),    # (0,0)
+        FloatViolation("warp", 4, 4, 1),    # (4,4)
+        FloatViolation("weft", 2, 6, 1),    # (2,6)
+    ]
+    result = aggregate_float_risk_zones(matrix, violations, False)
+    check([z.cells[0] for z in result.zones] == [(0, 0), (2, 6), (4, 4)],
+          "equal severity single cells ordered by smallest cell (row then col)")
+    check([z.directions for z in result.zones]
+          == [["warp"], ["weft"], ["warp"]],
+          "each isolated cell carries its violation direction")
+
+    # 不同浮长的两条真实多单元经浮长（列相隔，不相邻）：长度 3 与长度 5
+    violations2 = [
+        FloatViolation("warp", 0, 0, 3),   # (0,0)(1,0)(2,0)，浮长 3
+        FloatViolation("warp", 4, 1, 5),   # (1,4)..(5,4)，浮长 5
+    ]
+    result2 = aggregate_float_risk_zones(matrix, violations2, False)
+    check([(z.max_float, z.area, z.cells[0]) for z in result2.zones]
+          == [(5, 5, (1, 4)), (3, 3, (0, 0))],
+          "zones with distinct max_float sorted by severity desc")
+
+
+def test_risk_zones_area_secondary_sort():
+    # 浮长相同，面积大的排前：两个分离区域（同列间隔行不相邻）
+    matrix = [[0] * 3 for _ in range(6)]
+    violations = [
+        FloatViolation("warp", 1, 0, 1),   # (0,1) 面积 1
+        FloatViolation("warp", 1, 2, 2),   # (2,1)(3,1) 面积 2
+    ]
+    result = aggregate_float_risk_zones(matrix, violations, False)
+    check([(z.area, z.max_float) for z in result.zones]
+          == [(2, 2), (1, 1)],
+          "equal max_float tie broken by area desc")
+
+
+def test_risk_zones_cyclic_seam_merge():
+    # 5x1：列 0 的循环合并经浮长 start=4 length=3，
+    # 覆盖 (4,0)(0,0)(1,0)；cyclic 下 (4,0) 与 (0,0) 首尾相邻 -> 1 个区
+    matrix = [[1], [1], [0], [0], [1]]
+    violations = violations_of_matrix(matrix, 2, True)
+    check([(v.direction, v.yarn_index, v.start, v.length) for v in violations]
+          == [("warp", 0, 4, 3)], "cyclic wrap violation expanded from stored run")
+    result = aggregate_float_risk_zones(matrix, violations, True)
+    check(len(result.zones) == 1, "cyclic seam cells merge into one zone")
+    check(result.zones[0].cells == [(0, 0), (1, 0), (4, 0)],
+          "cyclic zone cells sorted, spanning both ends")
+    check((result.zones[0].min_row, result.zones[0].max_row) == (0, 4),
+          "wrap-around zone bbox spans the full row range")
+
+    # 同一违规非循环语义下 (4,0) 与 (0,0) 不相邻（且非循环审计本就不产生该违规；
+    # 直接用展开函数验证非循环邻接）：构造两段不跨边界的违规
+    result_nc = aggregate_float_risk_zones(
+        matrix, [FloatViolation("warp", 0, 0, 1),
+                 FloatViolation("warp", 0, 4, 1)], False
+    )
+    check(len(result_nc.zones) == 2,
+          "non-cyclic: top and bottom cells are not adjacent")
+
+    # 水平方向回绕：1x5 行纬浮长 start=3 length=4 覆盖 (0,3)(0,4)(0,0)(0,1)
+    matrix_w = [[0, 0, 1, 0, 0]]
+    violations_w = violations_of_matrix(matrix_w, 2, True)
+    check([(v.start, v.length) for v in violations_w] == [(3, 4)],
+          "weft cyclic wrap run detected")
+    result_w = aggregate_float_risk_zones(matrix_w, violations_w, True)
+    check(len(result_w.zones) == 1
+          and result_w.zones[0].cells == [(0, 0), (0, 1), (0, 3), (0, 4)],
+          "horizontal seam cells merge cyclically")
+    check(result_w.zones[0].max_float == 4
+          and result_w.zones[0].directions == ["weft"],
+          "cyclic weft zone summary")
+    # 非循环语义下同类的两段短违规（(0,0)(0,1) 与 (0,3)(0,4)）首尾不相邻
+    result_w_nc = aggregate_float_risk_zones(
+        matrix_w, [FloatViolation("weft", 0, 0, 2),
+                   FloatViolation("weft", 0, 3, 2)], False
+    )
+    check(sorted(len(z.cells) for z in result_w_nc.zones) == [2, 2],
+          "non-cyclic runs keep the two ends apart")
+    # 非循环违规段越界 -> DesignError（取模回绕只在 cyclic 下合法）
+    try:
+        aggregate_float_risk_zones(matrix_w, violations_w, False)
+        check(False, "wrapping violation rejected under non-cyclic semantics")
+    except DesignError:
+        check(True, "wrapping violation rejected under non-cyclic semantics")
+
+
+def test_risk_zones_dict_violations_and_validation():
+    # 已入库的违规记录是 dict 形式，接口路径直接消费
+    matrix = [[1, 0], [0, 0]]
+    violations = [
+        {"direction": "warp", "yarn_index": 0, "start": 0, "length": 2},
+        {"direction": "weft", "yarn_index": 1, "start": 0, "length": 2},
+    ]
+    result = aggregate_float_risk_zones(matrix, violations, False)
+    check(len(result.zones) == 1 and result.zones[0].area == 3,
+          "dict violations expand and merge like dataclass violations")
+    check(result.zones[0].directions == ["warp", "weft"],
+          "dict violations union directions")
+
+    bad_inputs = [
+        [{"direction": "diag", "yarn_index": 0, "start": 0, "length": 1}],
+        [{"direction": "warp", "yarn_index": 9, "start": 0, "length": 1}],
+        [{"direction": "weft", "yarn_index": 9, "start": 0, "length": 1}],
+        [{"direction": "warp", "yarn_index": 0, "start": 0, "length": "x"}],
+        [{"direction": "weft", "yarn_index": 0, "start": -1, "length": 1}],
+        [{"direction": "warp", "yarn_index": 0, "start": 1, "length": 2}],
+        [{"direction": "weft", "yarn_index": 1, "start": 1, "length": 2}],
+        [("warp", 0, 0, 1)],
+    ]
+    for bad in bad_inputs:
+        try:
+            aggregate_float_risk_zones(matrix, bad, False)
+            check(False, f"bad violation {bad} rejected")
+        except DesignError:
+            check(True, "")
+    try:
+        aggregate_float_risk_zones([], [], False)
+        check(False, "empty matrix rejected")
+    except DesignError:
+        check(True, "empty matrix rejected")
+
+
 def test_validation():
     ok_cases = []
     # 维度不一致：绑综矩阵不是矩形
@@ -935,5 +1136,12 @@ if __name__ == "__main__":
     test_loom_fit_constant_matrix_collapses_to_one_by_one()
     test_loom_fit_first_seen_numbering_and_single_cell()
     test_loom_fit_random_properties()
+    test_risk_zones_no_violations()
+    test_risk_zones_warp_weft_merge_mixed_direction()
+    test_risk_zones_diagonal_touch_not_merged()
+    test_risk_zones_severity_ordering()
+    test_risk_zones_area_secondary_sort()
+    test_risk_zones_cyclic_seam_merge()
+    test_risk_zones_dict_violations_and_validation()
     test_validation()
     print("all tests passed")

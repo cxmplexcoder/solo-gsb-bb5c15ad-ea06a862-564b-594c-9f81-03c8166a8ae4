@@ -165,6 +165,53 @@ class RepairPlanStep:
 
 
 @dataclass
+class RiskZone:
+    """一片由超限浮长单元四邻接合并而成的连通风险区域。"""
+
+    cells: list[tuple[int, int]]  # 区域内矩阵单元 (行, 列)，按行、列升序
+    min_row: int                  # 包围盒顶行（最小行号）
+    min_col: int                  # 包围盒左列（最小列号）
+    max_row: int                  # 包围盒底行（最大行号）
+    max_col: int                  # 包围盒右列（最大列号）
+    area: int                     # 面积 = 区域单元数
+    max_float: int                # 区域内单元涉及的最大浮长
+    directions: list[str]         # 涉及方向："warp"、"weft" 去重，warp 在前
+
+    def to_dict(self) -> dict:
+        return {
+            "cells": [{"row": r, "col": c} for r, c in self.cells],
+            "bbox": {
+                "min_row": self.min_row,
+                "min_col": self.min_col,
+                "max_row": self.max_row,
+                "max_col": self.max_col,
+                "rows": self.max_row - self.min_row + 1,
+                "cols": self.max_col - self.min_col + 1,
+            },
+            "area": self.area,
+            "max_float": self.max_float,
+            "directions": self.directions,
+        }
+
+
+@dataclass
+class FloatRiskZones:
+    """超限浮长单元的连通区域聚合结果。"""
+
+    warp_ends: int              # 经纱数（矩阵列数）
+    weft_picks: int             # 纬纱数（矩阵行数）
+    zones: list[RiskZone]       # 风险区域，按严重度降序
+
+    def to_dict(self) -> dict:
+        return {
+            "warp_ends": self.warp_ends,
+            "weft_picks": self.weft_picks,
+            "zone_count": len(self.zones),
+            "zones": [z.to_dict() for z in self.zones],
+        }
+
+
+@dataclass
 class LoomFitReduction:
     """基于交织矩阵等价类约简出的最少综框/踏板穿综草案。"""
 
@@ -423,6 +470,164 @@ def audit_floats(
     validate_design(threading, tie_up, treadling, max_float)
     matrix = build_interlacing(threading, tie_up, treadling)
     return matrix, violations_of_matrix(matrix, max_float, cyclic)
+
+
+def _violation_as_tuple(violation: FloatViolation | dict) -> tuple[str, int, int, int]:
+    """规范化一条违规记录（dataclass 或已入库 dict）为
+    (direction, yarn_index, start, length)。"""
+    if isinstance(violation, FloatViolation):
+        return (
+            violation.direction,
+            violation.yarn_index,
+            violation.start,
+            violation.length,
+        )
+    if not isinstance(violation, dict):
+        raise DesignError(f"invalid violation record: {violation!r}")
+    try:
+        direction = violation["direction"]
+        yarn_index = violation["yarn_index"]
+        start = violation["start"]
+        length = violation["length"]
+    except (KeyError, TypeError) as exc:
+        raise DesignError(f"invalid violation record: {violation!r}") from exc
+    if direction not in ("warp", "weft"):
+        raise DesignError(f"invalid violation direction: {direction!r}")
+    for name, value in (
+        ("yarn_index", yarn_index),
+        ("start", start),
+        ("length", length),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise DesignError(f"violation {name} must be an integer, got {value!r}")
+    return direction, yarn_index, start, length
+
+
+def aggregate_float_risk_zones(
+    matrix: list[list[int]],
+    violations: list[FloatViolation] | list[dict],
+    cyclic: bool,
+) -> FloatRiskZones:
+    """把每条超限浮长违规展开为矩阵单元，并按经纬相邻合并为连通风险区域。
+
+    展开规则：
+    - warp 违规（列 yarn_index 上连续的 1，起点 start、长度 length）展开为
+      单元 ((start + k) % 行数, yarn_index)，k = 0..length-1；
+    - weft 违规（行 yarn_index 上连续的 0）展开为
+      (yarn_index, (start + k) % 列数)。
+    对 cyclic 合并段，start 取尾部段起点、长度为跨边界两段之和，因此统一
+    取模即可正确覆盖首尾两侧的单元（同一单元被多条违规覆盖时去重，涉及
+    方向取并集、浮长取最大值）。
+
+    合并规则：在展开得到的单元集合上做四邻接（上、下、左、右）连通分量。
+    非循环设计只在矩阵矩形范围内相邻；cyclic 设计在经纬两轴首尾相接
+    （环面拓扑）：末行单元与首行单元、末列单元与首列单元也互为邻居。
+    对角线接触（仅共享顶点）不合并。
+
+    每个区域给出单元坐标（按行、列升序）、轴对齐包围盒、面积（单元数）、
+    区域内最大浮长以及涉及方向（去重，warp 在 weft 前）。区域按严重度
+    降序：max_float 大者优先，其次面积大者，再次取区域内最小单元坐标
+    （行后列）升序作为确定性平局裁决。不修改传入数据。
+    """
+    if not matrix or not matrix[0]:
+        raise DesignError("interlacing matrix must be non-empty")
+    picks = len(matrix)          # 纬纱数（行数）
+    ends = len(matrix[0])        # 经纱数（列数）
+
+    # cell -> (最大浮长, 涉及方向集合)
+    flagged: dict[tuple[int, int], tuple[int, set[str]]] = {}
+    for raw in violations:
+        direction, yarn_index, start, length = _violation_as_tuple(raw)
+        if length <= 0 or start < 0:
+            raise DesignError(
+                f"invalid violation (start={start}, length={length})"
+            )
+        if direction == "warp":
+            if not 0 <= yarn_index < ends:
+                raise DesignError(
+                    f"warp violation yarn_index {yarn_index} out of range "
+                    f"[0, {ends})"
+                )
+            if not cyclic and start + length > picks:
+                raise DesignError(
+                    f"non-cyclic warp violation exceeds column: "
+                    f"start={start}, length={length}, column height={picks}"
+                )
+            cells = (
+                ((start + k) % picks, yarn_index) for k in range(length)
+            )
+        else:
+            if not 0 <= yarn_index < picks:
+                raise DesignError(
+                    f"weft violation yarn_index {yarn_index} out of range "
+                    f"[0, {picks})"
+                )
+            if not cyclic and start + length > ends:
+                raise DesignError(
+                    f"non-cyclic weft violation exceeds row: "
+                    f"start={start}, length={length}, row width={ends}"
+                )
+            cells = (
+                (yarn_index, (start + k) % ends) for k in range(length)
+            )
+        for cell in cells:
+            existing = flagged.get(cell)
+            if existing is None:
+                flagged[cell] = (length, {direction})
+            else:
+                existing[1].add(direction)
+                if length > existing[0]:
+                    flagged[cell] = (length, existing[1])
+
+    remaining = set(flagged)
+    zones: list[RiskZone] = []
+    # 按行主序取起点，保证连通分量及单元列表的产出顺序确定
+    for seed in sorted(flagged):
+        if seed not in remaining:
+            continue
+        component: list[tuple[int, int]] = []
+        max_float = 0
+        directions: set[str] = set()
+        stack = [seed]
+        remaining.remove(seed)
+        while stack:
+            r, c = stack.pop()
+            component.append((r, c))
+            cell_float, cell_dirs = flagged[(r, c)]
+            if cell_float > max_float:
+                max_float = cell_float
+            directions |= cell_dirs
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                if cyclic:
+                    neighbor = ((r + dr) % picks, (c + dc) % ends)
+                else:
+                    neighbor = (r + dr, c + dc)
+                    if not (0 <= neighbor[0] < picks and 0 <= neighbor[1] < ends):
+                        continue
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+        component.sort()
+        rows = [r for r, _ in component]
+        cols = [c for _, c in component]
+        ordered_dirs = [d for d in ("warp", "weft") if d in directions]
+        zones.append(
+            RiskZone(
+                cells=component,
+                min_row=min(rows),
+                min_col=min(cols),
+                max_row=max(rows),
+                max_col=max(cols),
+                area=len(component),
+                max_float=max_float,
+                directions=ordered_dirs,
+            )
+        )
+
+    zones.sort(
+        key=lambda z: (-z.max_float, -z.area, z.cells[0][0], z.cells[0][1])
+    )
+    return FloatRiskZones(warp_ends=ends, weft_picks=picks, zones=zones)
 
 
 def threshold_profile(

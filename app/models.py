@@ -164,6 +164,62 @@ class ErrorOut(BaseModel):
     detail: str
 
 
+class RiskCellOut(BaseModel):
+    """风险区域内的一个交织矩阵单元。"""
+
+    row: int = Field(..., description="单元所在纬纱行号")
+    col: int = Field(..., description="单元所在经纱列号")
+
+
+class RiskBBoxOut(BaseModel):
+    """风险区域的轴对齐包围盒（取区域内单元的最小/最大行列号）。"""
+
+    min_row: int = Field(..., description="包围盒顶行（最小行号）")
+    min_col: int = Field(..., description="包围盒左列（最小列号）")
+    max_row: int = Field(..., description="包围盒底行（最大行号）")
+    max_col: int = Field(..., description="包围盒右列（最大列号）")
+    rows: int = Field(..., description="包围盒高度：max_row - min_row + 1")
+    cols: int = Field(..., description="包围盒宽度：max_col - min_col + 1")
+
+
+class RiskZoneOut(BaseModel):
+    """一片由超限浮长单元四邻接合并而成的连通风险区域。"""
+
+    cells: list[RiskCellOut] = Field(
+        ..., description="区域内矩阵单元坐标列表，按行、列升序"
+    )
+    bbox: RiskBBoxOut = Field(
+        ...,
+        description="轴对齐包围盒（原矩阵坐标）；循环设计中跨首尾边界的区域"
+        "其包围盒可能横跨整条边（rows/cols 等于矩阵对应尺寸），单元的"
+        "精确集合以 cells 为准",
+    )
+    area: int = Field(..., description="区域面积 = 区域内单元数")
+    max_float: int = Field(..., description="区域内单元涉及的最大浮长")
+    directions: list[Literal["warp", "weft"]] = Field(
+        ...,
+        description="区域涉及的浮长方向（去重，warp 在 weft 前）：仅经向、"
+        "仅纬向或两者兼有",
+    )
+
+
+class FloatRiskZonesOut(BaseModel):
+    """超限浮长单元的连通区域聚合结果。"""
+
+    design_id: int = Field(..., description="被聚合的设计 ID")
+    cyclic: bool = Field(
+        ..., description="聚合沿用的设计循环声明（true 时经纬两轴首尾相接）"
+    )
+    warp_ends: int = Field(..., description="经纱数（交织矩阵列数）")
+    weft_picks: int = Field(..., description="纬纱数（交织矩阵行数）")
+    zone_count: int = Field(..., description="风险区域总数（无违规时为 0）")
+    zones: list[RiskZoneOut] = Field(
+        ...,
+        description="风险区域列表，按严重度降序：max_float 大者优先，"
+        "其次面积大者，再次取区域内最小单元坐标（行后列）升序",
+    )
+
+
 class BalanceHotspotsIn(BaseModel):
     """局部交织均衡审计请求。"""
 

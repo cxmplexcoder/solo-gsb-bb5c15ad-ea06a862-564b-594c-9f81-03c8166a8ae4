@@ -18,7 +18,10 @@
 （最少综框/踏板约简）**：基于交织矩阵把完整列向量相同的经纱并入同一约简
 综框、完整行向量相同的纬纱并入同一约简踏板，重建穿综/绑综/踏综并逐点
 校验与原矩阵一致，给出最少综框/踏板数、约简草案、相对原设计的减少量，
-以及在给定设备综框/踏板上限下是否可织（`fits`）。
+以及在给定设备综框/踏板上限下是否可织（`fits`）。还可对已存设计做
+**风险区域聚合**：读取已存交织矩阵与原有浮长违规记录，把每条超限经/纬
+浮长展开为矩阵单元，在经纬四邻接（循环设计首尾相接）规则下合并为连通
+区域，按严重度降序给出每区的单元坐标、包围盒、面积、最大浮长与涉及方向。
 
 ## 快速启动
 
@@ -104,6 +107,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/designs/{id}/compare` | 设计对齐比对：枚举第二份矩阵的经纬循环错位，返回最佳偏移、错位坐标与汇总 |
 | `POST` | `/designs/{id}/balance-hotspots` | 局部交织均衡审计：逐窗统计 `1` 的占比，返回超界窗口、偏离幅度与最严重窗口 |
 | `POST` | `/designs/{id}/loom-fit` | 织机适配：按交织矩阵列/行向量等价类约简出最少综框/踏板草案，判断在给定设备上限下是否可织 |
+| `GET` | `/designs/{id}/float-risk-zones` | 风险区域聚合：把已存违规展开为矩阵单元并按经纬相邻合并，按严重度降序返回区域列表与总数 |
 | `GET` | `/health` | 健康检查 |
 
 ### 示例：提交设计
@@ -590,6 +594,105 @@ curl -s -X POST http://localhost:8000/designs/1/loom-fit \
 `"fits": false, "min_shafts": 4, "min_treadles": 4, "shafts_reduction": 0,
 "treadles_reduction": 0`。
 
+### 风险区域聚合（float-risk-zones）
+
+`GET http://localhost:8000/designs/{id}/float-risk-zones`：直接读取**已入库**
+的交织矩阵与**原有浮长违规记录**（不重新审计、不改阈值），把每条超限
+浮长展开为其覆盖的矩阵单元，再按经纬相邻合并为连通风险区域。接口只读，
+**不改库**；设计不存在返回 404，无违规时返回空列表 `zones: []`、
+`zone_count: 0`。
+
+展开与合并规则：
+
+- **展开**：`warp` 违规（列 `yarn_index` 上起点 `start`、长度 `length` 的
+  连续 `1`）展开为单元 `((start + k) % 行数, yarn_index)`；`weft` 违规展开为
+  `(yarn_index, (start + k) % 列数)`，`k = 0..length-1`。循环合并段的
+  `start` 是尾部段起点、长度为跨边界两段之和，统一取模即可覆盖首尾两侧
+  的单元；同一单元被多条违规覆盖时去重，涉及方向取并集、浮长取最大值。
+- **相邻**：四邻接（上、下、左、右）；仅对角接触（共享顶点）不合并。
+  **非循环设计**只在矩形矩阵范围内相邻；**循环设计**（`cyclic: true`）在
+  经纬两轴首尾相接（环面拓扑），末行与首行、末列与首列的单元也互为邻居。
+- **严重度排序**（降序）：区域内最大浮长 `max_float` 大者优先；其次面积
+  （单元数）大者；再次取区域内最小单元坐标（先行后列）升序作为确定性平局。
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `design_id` / `cyclic` | 设计 ID 与聚合沿用的循环声明 |
+| `warp_ends` / `weft_picks` | 交织矩阵列数（经纱数）/ 行数（纬纱数） |
+| `zone_count` | 风险区域总数 |
+| `zones[]` | 风险区域列表，按严重度降序 |
+| `zones[].cells[]` | 区域内单元坐标（`row`、`col`），按行、列升序 |
+| `zones[].bbox` | 轴对齐包围盒：`min_row`、`min_col`、`max_row`、`max_col` 及 `rows`、`cols`（原矩阵坐标；跨首尾边界的循环区域其包围盒可能横跨整条边，精确单元以 `cells` 为准） |
+| `zones[].area` | 面积 = 区域单元数 |
+| `zones[].max_float` | 区域内单元涉及的最大浮长 |
+| `zones[].directions` | 涉及方向（去重，`warp` 在 `weft` 前）：仅经向、仅纬向或两者兼有 |
+
+```bash
+curl -s http://localhost:8000/designs/1/float-risk-zones
+```
+
+响应（200，3×3、`max_float=1` 的矩阵 `110/110/000`：两条长度 2 的经向
+浮长与一条长度 3 的纬向浮长在边缘相邻，合并为一个混合方向区域）：
+
+```json
+{
+  "design_id": 1,
+  "cyclic": false,
+  "warp_ends": 3,
+  "weft_picks": 3,
+  "zone_count": 1,
+  "zones": [
+    {
+      "cells": [
+        {"row": 0, "col": 0}, {"row": 0, "col": 1},
+        {"row": 1, "col": 0}, {"row": 1, "col": 1},
+        {"row": 2, "col": 0}, {"row": 2, "col": 1}, {"row": 2, "col": 2}
+      ],
+      "bbox": {"min_row": 0, "min_col": 0, "max_row": 2, "max_col": 2,
+               "rows": 3, "cols": 3},
+      "area": 7,
+      "max_float": 3,
+      "directions": ["warp", "weft"]
+    }
+  ]
+}
+```
+
+循环设计跨首尾边界合并（5×1 矩阵列值 `1,1,0,0,1`、`max_float=2`）：
+违规为 `{"direction": "warp", "yarn_index": 0, "start": 4, "length": 3}`，
+展开为 `(4,0)(0,0)(1,0)`，环面相邻合并为一个区域：
+
+```json
+{
+  "design_id": 2,
+  "cyclic": true,
+  "warp_ends": 1,
+  "weft_picks": 5,
+  "zone_count": 1,
+  "zones": [{
+    "cells": [{"row": 0, "col": 0}, {"row": 1, "col": 0}, {"row": 4, "col": 0}],
+    "bbox": {"min_row": 0, "min_col": 0, "max_row": 4, "max_col": 0,
+             "rows": 5, "cols": 1},
+    "area": 3,
+    "max_float": 3,
+    "directions": ["warp"]
+  }]
+}
+```
+
+无违规或设计不存在：
+
+```json
+{"design_id": 3, "cyclic": false, "warp_ends": 4, "weft_picks": 4,
+ "zone_count": 0, "zones": []}
+```
+
+```json
+{"detail": "design 99999 not found"}
+```
+
 ### 拒绝情形（HTTP 400，整份设计不入库）
 
 - 绑综矩阵非矩形（各行长度不一致）或含非 0/1 值；
@@ -612,6 +715,7 @@ python3 tests/test_api_threshold_profile.py  # threshold-profile 接口集成测
 python3 tests/test_api_compare.py            # compare 接口集成测试
 python3 tests/test_api_balance_hotspots.py   # balance-hotspots 接口集成测试
 python3 tests/test_api_loom_fit.py           # loom-fit 接口集成测试
+python3 tests/test_api_float_risk_zones.py   # float-risk-zones 接口集成测试
 ```
 
 接口测试使用临时 SQLite 文件与 FastAPI TestClient，不需要启动服务，也不会
@@ -640,6 +744,7 @@ tests/
   test_api_compare.py             # compare 接口集成测试（TestClient，临时库）
   test_api_balance_hotspots.py    # balance-hotspots 接口集成测试（TestClient，临时库）
   test_api_loom_fit.py            # loom-fit 接口集成测试（TestClient，临时库）
+  test_api_float_risk_zones.py    # float-risk-zones 接口集成测试（TestClient，临时库）
 Dockerfile
 docker-compose.yml
 requirements.txt
