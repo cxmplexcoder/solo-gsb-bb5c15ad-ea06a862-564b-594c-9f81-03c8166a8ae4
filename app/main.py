@@ -17,6 +17,7 @@ from .models import (
     DesignOut,
     DesignSummary,
     ErrorOut,
+    FloatRiskZonesOut,
     LoomFitIn,
     LoomFitOut,
     RepeatPeriodOut,
@@ -124,6 +125,41 @@ def get_audit(design_id: int) -> dict:
     if stored is None:
         raise HTTPException(status_code=404, detail=f"design {design_id} not found")
     return stored["audit"]
+
+
+@app.get(
+    "/designs/{design_id}/float-risk-zones",
+    response_model=FloatRiskZonesOut,
+    responses={404: {"model": ErrorOut, "description": "设计不存在"}},
+    tags=["designs"],
+)
+def get_float_risk_zones(design_id: int) -> dict:
+    """风险区域聚合：读取已入库的交织矩阵与原浮长违规记录（不重新审计），
+    将每条超限经/纬浮长从其连续段起点展开为矩阵单元，在经纬相邻（上、下、
+    左、右四邻接，对角不算）规则下合并为连通区域；设计声明循环（cyclic）时
+    矩阵首尾相接，跨越末行/首行、末列/首列的单元同样连通。
+
+    返回按严重度降序的区域列表（最大浮长、面积依次降序，平局取最小单元坐标
+    升序），每区给出单元坐标、包围盒（跨接缝区域回显 crosses_*_seam 与
+    回绕覆盖尺寸）、面积、最大浮长及涉及方向，并返回区域总数 total_zones。
+    设计不存在返回 404；设计无超限浮长时 zones 为空列表、total_zones 为 0。
+    接口只读计算，不改库。"""
+    stored = db.get_design(design_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"design {design_id} not found")
+    audit = stored["audit"]
+    zones = weave.aggregate_float_risk_zones(
+        audit["interlacing"], audit["violations"], stored["cyclic"]
+    )
+    return {
+        "design_id": design_id,
+        "cyclic": stored["cyclic"],
+        "warp_ends": stored["warp_ends"],
+        "weft_picks": stored["weft_picks"],
+        "max_float": stored["max_float"],
+        "zones": [z.to_dict() for z in zones],
+        "total_zones": len(zones),
+    }
 
 
 @app.get(

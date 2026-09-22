@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.weave import (  # noqa: E402
     DesignError,
+    FloatViolation,
+    aggregate_float_risk_zones,
     analyze_repeat_period,
     audit_floats,
     best_alignment,
@@ -858,6 +860,309 @@ def test_loom_fit_random_properties():
     print("  ok: loom fit random property checks (200 cases)")
 
 
+def test_float_risk_zones_orthogonal_merge():
+    # 经向竖段与纬向横段在一个单元处正交相邻 -> 合并为一个 L 形区域
+    matrix = [[0] * 4 for _ in range(4)]
+    violations = [
+        FloatViolation("warp", yarn_index=1, start=0, length=3),
+        FloatViolation("weft", yarn_index=2, start=1, length=3),
+    ]
+    zones = aggregate_float_risk_zones(matrix, violations, cyclic=False)
+    check(len(zones) == 1, "orthogonal warp/weft runs merge into one zone")
+    zone = zones[0]
+    expected_cells = [(0, 1), (1, 1), (2, 1), (2, 2), (2, 3)]
+    check([(c.row, c.col) for c in zone.cells] == expected_cells,
+          "merged zone cells in row-major order")
+    check(zone.area == 5, "zone area counts unique cells")
+    check(zone.max_float_length == 3, "max float length across violations")
+    check(zone.directions == ["warp", "weft"], "directions ordered warp then weft")
+    check(
+        zone.min_row == 0 and zone.max_row == 2
+        and zone.min_col == 1 and zone.max_col == 3
+        and zone.height == 3 and zone.width == 3
+        and zone.crosses_weft_seam is False and zone.crosses_warp_seam is False,
+        "non-cyclic zone bbox is a plain bounding box",
+    )
+
+
+def test_float_risk_zones_diagonal_not_connected():
+    # 两条 3 长浮长仅在对角方向接触 -> 两个独立区域
+    matrix = [[0] * 4 for _ in range(4)]
+    violations = [
+        FloatViolation("warp", yarn_index=0, start=0, length=3),
+        FloatViolation("weft", yarn_index=3, start=1, length=3),
+    ]
+    zones = aggregate_float_risk_zones(matrix, violations, cyclic=False)
+    check(len(zones) == 2, "diagonal contact does not connect zones")
+    lengths = [z.max_float_length for z in zones]
+    check(lengths == [3, 3], "both zones keep float length 3")
+    cells = [[(c.row, c.col) for c in z.cells] for z in zones]
+    # 面积相同（3=3）时平局按最小单元坐标行主序：(0,0) 在 (3,1) 前
+    check(cells[0] == [(0, 0), (1, 0), (2, 0)], "first zone is the earlier-seeded one")
+    check(cells[1] == [(3, 1), (3, 2), (3, 3)], "second zone stays separate")
+
+    # 不同严重度：4 长区域即使种子更晚也排在 3 长区域之前（5x5 上二者分离）
+    big = [[0] * 5 for _ in range(5)]
+    zones = aggregate_float_risk_zones(
+        big,
+        [FloatViolation("warp", 0, 0, 3), FloatViolation("weft", 4, 1, 4)],
+        cyclic=False,
+    )
+    check([z.max_float_length for z in zones] == [4, 3],
+          "zones sorted by max float length descending")
+    check(zones[0].area == 4 and zones[1].area == 3, "areas follow sorting")
+
+
+def test_float_risk_zones_cyclic_seams():
+    # 4 列环面：行 0 上 start=3 的 3 长纬浮覆盖 (0,3)(0,0)(0,1)
+    matrix = [[0] * 4 for _ in range(4)]
+    v = [FloatViolation("weft", 0, 3, 3)]
+
+    # 非循环下同条记录 start+length 越过矩阵边界 -> 拒绝
+    raised = False
+    try:
+        aggregate_float_risk_zones(matrix, v, cyclic=False)
+    except DesignError:
+        raised = True
+    check(raised, "non-cyclic run past the matrix edge is rejected")
+
+    zones = aggregate_float_risk_zones(matrix, v, cyclic=True)
+    zone = zones[0]
+    check([(c.row, c.col) for c in zone.cells] == [(0, 0), (0, 1), (0, 3)],
+          "wrap run covers tail+head cells in row-major order")
+    check(zone.crosses_warp_seam is True and zone.crosses_weft_seam is False,
+          "zone crossing last/first column flags warp seam only")
+    check(zone.min_col == 0 and zone.max_col == 3 and zone.width == 3,
+          "wrapping bbox: raw extremes touch both edges, wrapped width 3")
+    check(zone.min_row == 0 and zone.max_row == 0 and zone.height == 1,
+          "non-wrapped axis has a degenerate bbox")
+
+    # 跨越首末行接缝的经向浮长：start=3 长 3 -> (3,0)(0,0)(1,0)
+    zones = aggregate_float_risk_zones(
+        matrix, [FloatViolation("warp", 0, 3, 3)], cyclic=True
+    )
+    zone = zones[0]
+    check(zone.crosses_weft_seam is True and zone.crosses_warp_seam is False,
+          "wrap along rows flags weft seam only")
+    check(zone.min_row == 0 and zone.max_row == 3 and zone.height == 3,
+          "wrapping row bbox: raw extremes touch both edges, wrapped height 3")
+
+    # 非循环下分列于首末列（列 0 与列 3）的两个边界段不相连；
+    # 循环时两列经首末列接缝相邻，合并为一区
+    boundary = [FloatViolation("warp", 0, 2, 2), FloatViolation("warp", 3, 2, 2)]
+    separate = aggregate_float_risk_zones(matrix, boundary, cyclic=False)
+    check(len(separate) == 2, "first/last column runs stay separate when non-cyclic")
+    joined = aggregate_float_risk_zones(matrix, boundary, cyclic=True)
+    check(len(joined) == 1 and joined[0].crosses_warp_seam is True
+          and joined[0].area == 4,
+          "first/last column runs join across the warp seam when cyclic")
+
+
+def test_float_risk_zones_cyclic_double_seam():
+    # 整幅 4x4 全部风险：环面上连通为一区，两方向都跨缝，覆盖整个矩阵
+    matrix = [[1] * 4 for _ in range(4)]
+    violations = [
+        FloatViolation("warp", w, 0, 4) for w in range(4)
+    ] + [
+        FloatViolation("weft", h, 0, 4) for h in range(4)
+    ]
+    zones = aggregate_float_risk_zones(matrix, violations, cyclic=True)
+    check(len(zones) == 1, "all-marked torus is a single connected zone")
+    zone = zones[0]
+    check(zone.area == 16, "zone covers the whole 4x4 matrix")
+    check(zone.crosses_weft_seam and zone.crosses_warp_seam,
+          "full-matrix zone crosses both seams")
+    check(zone.height == 4 and zone.width == 4, "wrapped bbox covers full size")
+    check(zone.max_float_length == 4 and zone.directions == ["warp", "weft"],
+          "full-matrix zone aggregates length and both directions")
+
+    # 尺寸 1 的环面：上下左右都是自环，不应误判为跨缝
+    zones = aggregate_float_risk_zones(
+        [[1]], [FloatViolation("warp", 0, 0, 1)], cyclic=True
+    )
+    check(len(zones) == 1 and zones[0].area == 1
+          and not zones[0].crosses_weft_seam and not zones[0].crosses_warp_seam
+          and zones[0].height == 1 and zones[0].width == 1,
+          "1x1 cyclic self-loop is one cell with no seam crossing")
+
+
+def test_float_risk_zones_random_against_brute_force():
+    """随机标记单元（用 wrap/非 wrap 的 FloatViolation 展开）与独立环面/平面
+    洪水填充对比：区域数、成员、跨缝标志与包围盒尺寸逐例一致。"""
+    rng = random.Random(20260922)
+
+    def brute_force(marked, picks, ends, cyclic):
+        remaining = set(marked)
+        components = []
+        while remaining:
+            seed = min(remaining)
+            remaining.remove(seed)
+            seen = {seed}
+            queue = [seed]
+            crosses = [False, False]
+            while queue:
+                r, c = queue.pop()
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    if cyclic:
+                        if dr != 0:
+                            if picks == 1:
+                                continue
+                            nr, nc = (r + dr) % picks, c
+                            wrapped = {r, nr} == {0, picks - 1}
+                        else:
+                            if ends == 1:
+                                continue
+                            nr, nc = r, (c + dc) % ends
+                            wrapped = {c, nc} == {0, ends - 1}
+                    else:
+                        nr, nc = r + dr, c + dc
+                        if not (0 <= nr < picks and 0 <= nc < ends):
+                            continue
+                    if (nr, nc) not in marked:
+                        continue
+                    # 接缝边只在两个端点同属本分量时计数（另一端已被本
+                    # 分量发现或尚待本分量发现）；通向其他分量的边不算
+                    if cyclic and wrapped and (
+                        (nr, nc) in seen or (nr, nc) in remaining
+                    ):
+                        if dr:
+                            crosses[0] = True
+                        if dc:
+                            crosses[1] = True
+                    if (nr, nc) in remaining:
+                        remaining.remove((nr, nc))
+                        seen.add((nr, nc))
+                        queue.append((nr, nc))
+            components.append((seen, tuple(crosses)))
+        return components
+
+    for _ in range(300):
+        picks = rng.randint(1, 6)
+        ends = rng.randint(1, 6)
+        cyclic = rng.random() < 0.5
+        matrix = [[0] * ends for _ in range(picks)]
+        violations = []
+        marked = {}
+        n_runs = rng.randint(0, picks + ends)
+        for _n in range(n_runs):
+            if rng.random() < 0.5:
+                w = rng.randrange(ends)
+                if cyclic:
+                    start = rng.randrange(picks)
+                    length = rng.randint(1, picks)
+                else:
+                    length = rng.randint(1, picks)
+                    start = rng.randrange(picks - length + 1)
+                violations.append(FloatViolation("warp", w, start, length))
+                for k in range(length):
+                    r = (start + k) if not cyclic else (start + k) % picks
+                    marked[(r, w)] = True
+            else:
+                h = rng.randrange(picks)
+                if cyclic:
+                    start = rng.randrange(ends)
+                    length = rng.randint(1, ends)
+                else:
+                    length = rng.randint(1, ends)
+                    start = rng.randrange(ends - length + 1)
+                violations.append(FloatViolation("weft", h, start, length))
+                for k in range(length):
+                    c = (start + k) if not cyclic else (start + k) % ends
+                    marked[(h, c)] = True
+
+        zones = aggregate_float_risk_zones(matrix, violations, cyclic)
+        comps = brute_force(marked, picks, ends, cyclic)
+
+        check(len(zones) == len(comps),
+              f"random: zone count matches brute force ({picks}x{ends}, "
+              f"cyclic={cyclic})")
+
+        zone_cells = {frozenset((c.row, c.col) for c in z.cells) for z in zones}
+        comp_cells = {frozenset(seen) for seen, _ in comps}
+        check(zone_cells == comp_cells,
+              "random: zone membership partitions match brute force")
+
+        zone_by_cells = {
+            frozenset((c.row, c.col) for c in z.cells): z for z in zones
+        }
+        for seen, crosses in comps:
+            z = zone_by_cells[frozenset(seen)]
+            check(z.area == len(seen), "random: area matches component size")
+            check((z.crosses_weft_seam, z.crosses_warp_seam) == crosses,
+                  "random: seam flags match brute-force wrap edges")
+            if not crosses[0]:
+                rows = [r for r, _ in seen]
+                check(z.height == max(rows) - min(rows) + 1
+                      and z.min_row == min(rows) and z.max_row == max(rows),
+                      "random: non-wrapping row bbox")
+            else:
+                check(1 <= z.height <= picks,
+                      "random: wrapping row height within matrix size")
+            if not crosses[1]:
+                cols = [c for _, c in seen]
+                check(z.width == max(cols) - min(cols) + 1
+                      and z.min_col == min(cols) and z.max_col == max(cols),
+                      "random: non-wrapping col bbox")
+            else:
+                check(1 <= z.width <= ends,
+                      "random: wrapping col width within matrix size")
+
+        # 严重度排序键单调不增
+        keys = [(z.max_float_length, z.area) for z in zones]
+        check(keys == sorted(keys, key=lambda k: (-k[0], -k[1])),
+              "random: zones severity-sorted")
+
+    check(True, "random risk-zone property checks (300 cases)")
+
+
+def test_float_risk_zones_empty_and_validation():
+    matrix = [[0, 1], [1, 0]]
+    check(aggregate_float_risk_zones(matrix, [], cyclic=False) == [],
+          "no violations -> empty zone list")
+    check(aggregate_float_risk_zones(matrix, [], cyclic=True) == [],
+          "no violations cyclic -> empty zone list")
+
+    # dict 形式的违规记录同样可展开
+    zones = aggregate_float_risk_zones(
+        matrix,
+        [{"direction": "weft", "yarn_index": 0, "start": 0, "length": 2}],
+        cyclic=False,
+    )
+    check([(c.row, c.col) for c in zones[0].cells] == [(0, 0), (0, 1)],
+          "dict-shaped violations are accepted")
+
+    bad_cases = [
+        ([], [], False),                                   # 空矩阵
+        ([[0], [0, 1]], [], False),                        # 非矩形矩阵
+        (matrix, [FloatViolation("sideways", 0, 0, 1)], False),  # 方向非法
+        (matrix, [FloatViolation("warp", 9, 0, 1)], False),      # 索引越界
+        (matrix, [FloatViolation("warp", 0, 0, 0)], False),      # 长度非正
+        (matrix, [FloatViolation("weft", 0, 0, 3)], False),      # 非循环越界
+    ]
+    for m, vs, cyc in bad_cases:
+        try:
+            aggregate_float_risk_zones(m, vs, cyc)
+            check(False, f"invalid case rejected: {vs}")
+        except DesignError:
+            pass
+    check(True, "invalid matrix/violation inputs raise DesignError")
+
+    # 与真实审计一致：非循环 3x3 全 1（底行 0）矩阵的风险单元展开
+    threading = [0, 0, 0]
+    tie_up = [[1], [0]]
+    treadling = [0, 0, 0, 1]
+    m, vs = audit_floats(threading, tie_up, treadling, max_float=2, cyclic=False)
+    zones = aggregate_float_risk_zones(m, vs, cyclic=False)
+    # 三条经向 3 长覆盖前 3 行 3x3=9 个单元；底纬一条 3 长 (3,0..2) 与列段在
+    # 第 2/3 行交界处上下相邻，全部 12 个矩阵单元连通
+    check(len(zones) == 1 and zones[0].area == 12,
+          "audit violations expand into one connected zone covering all 12 cells")
+    check(zones[0].max_float_length == 3
+          and zones[0].directions == ["warp", "weft"]
+          and zones[0].height == 4 and zones[0].width == 3,
+          "zone from real audit merges warp block and weft run")
+
+
 def test_validation():
     ok_cases = []
     # 维度不一致：绑综矩阵不是矩形
@@ -935,5 +1240,11 @@ if __name__ == "__main__":
     test_loom_fit_constant_matrix_collapses_to_one_by_one()
     test_loom_fit_first_seen_numbering_and_single_cell()
     test_loom_fit_random_properties()
+    test_float_risk_zones_orthogonal_merge()
+    test_float_risk_zones_diagonal_not_connected()
+    test_float_risk_zones_cyclic_seams()
+    test_float_risk_zones_cyclic_double_seam()
+    test_float_risk_zones_random_against_brute_force()
+    test_float_risk_zones_empty_and_validation()
     test_validation()
     print("all tests passed")

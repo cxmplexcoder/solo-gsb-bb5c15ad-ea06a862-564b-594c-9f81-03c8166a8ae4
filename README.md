@@ -18,7 +18,10 @@
 （最少综框/踏板约简）**：基于交织矩阵把完整列向量相同的经纱并入同一约简
 综框、完整行向量相同的纬纱并入同一约简踏板，重建穿综/绑综/踏综并逐点
 校验与原矩阵一致，给出最少综框/踏板数、约简草案、相对原设计的减少量，
-以及在给定设备综框/踏板上限下是否可织（`fits`）。
+以及在给定设备综框/踏板上限下是否可织（`fits`）。还可对已存设计做**浮长
+风险区域聚合**：读取已存交织矩阵与原浮长违规记录，将每条超限经/纬浮长展开
+为矩阵单元，按经纬相邻合并为连通区域（循环设计首尾相接），按严重度降序
+给出每区的单元、包围盒、面积、最大浮长与涉及方向。
 
 ## 快速启动
 
@@ -104,6 +107,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/designs/{id}/compare` | 设计对齐比对：枚举第二份矩阵的经纬循环错位，返回最佳偏移、错位坐标与汇总 |
 | `POST` | `/designs/{id}/balance-hotspots` | 局部交织均衡审计：逐窗统计 `1` 的占比，返回超界窗口、偏离幅度与最严重窗口 |
 | `POST` | `/designs/{id}/loom-fit` | 织机适配：按交织矩阵列/行向量等价类约简出最少综框/踏板草案，判断在给定设备上限下是否可织 |
+| `GET` | `/designs/{id}/float-risk-zones` | 浮长风险区域聚合：违规浮长展开为矩阵单元，按经纬相邻（循环时首尾相接）合并为连通区域 |
 | `GET` | `/health` | 健康检查 |
 
 ### 示例：提交设计
@@ -590,6 +594,101 @@ curl -s -X POST http://localhost:8000/designs/1/loom-fit \
 `"fits": false, "min_shafts": 4, "min_treadles": 4, "shafts_reduction": 0,
 "treadles_reduction": 0`。
 
+### 浮长风险区域聚合
+
+`GET http://localhost:8000/designs/{id}/float-risk-zones`：读取**已入库**的
+交织矩阵与原有浮长违规记录（不重新审计），把每条超限经/纬浮长从其连续段
+起点展开为矩阵单元，在**经纬相邻**规则下合并为连通区域。
+
+- `warp` 违规展开为该列上从 `start` 起的 `length` 个单元；`weft` 违规展开为
+  该行上同样区间的单元；跨边界合并段（见上文循环合并规则）在循环设计中
+  取模回绕展开，同时覆盖尾部与头部；
+- 两个风险单元仅在**上、下、左、右四邻接**（共边）时属于同一区域；仅对角
+  相邻不连通；**经向违规单元与纬向违规单元相邻时也合并**为同一区域；
+- 设计声明循环（`cyclic: true`）时，矩阵在经、纬两个方向首尾相接：末行与
+  首行、末列与首列互为邻居，跨边界的连通区域合并为一个；非循环设计边界不
+  相连；
+- 接口只读计算，**不改库**；设计不存在返回 404；设计无超限浮长时 `zones`
+  为空列表、`total_zones` 为 0。
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `design_id` / `cyclic` | 设计 ID 与区域连通沿用的循环声明 |
+| `warp_ends` / `weft_picks` | 交织矩阵的经纱数（列数）/ 纬纱数（行数） |
+| `max_float` | 设计入库时声明的最大浮长阈值 |
+| `zones[]` | 风险区域列表，按**严重度降序** |
+| `total_zones` | 区域总数（等于 `zones` 的长度） |
+
+`zones[]` 每个区域包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `area` | 区域面积：包含的矩阵单元数（同一单元被多条违规覆盖只计一次） |
+| `cells[]` | 单元坐标 `row`（纬纱行号）、`col`（经纱列号），按行、列升序（行主序） |
+| `bbox` | 包围盒（见下） |
+| `max_float_length` | 区域内各条超限浮长段的最大浮长 |
+| `directions` | 涉及方向，固定按 `["warp", "weft"]` 去重排列 |
+
+区域排序（严重度降序，稳定）：`max_float_length` 降序 → `area` 降序 →
+区域内最小单元坐标（行主序）升序。
+
+**包围盒 `bbox`**：`min_row`/`max_row`/`min_col`/`max_col` 为**原始矩阵
+坐标**极值；`height`/`width` 是把区域沿跨缝方向平移到普通平面上的**连续
+覆盖尺寸**（行/列跨度，与遍历起点无关）。非跨缝区域即普通外接矩形
+（`height = max_row - min_row + 1`）；跨越接缝的区域（`crosses_weft_seam`
+跨首/末行、`crosses_warp_seam` 跨首/末列为 `true`）原始极值同时触及 `0`
+与尺寸-1 两端，`height`/`width` 按回绕弧计算；铺满整轴时连续覆盖尺寸等于
+该轴尺寸。
+
+```bash
+curl -s http://localhost:8000/designs/1/float-risk-zones
+```
+
+响应（200，单列循环设计、跨边界合并出长度 4 的经向浮长时）：
+
+```json
+{
+  "design_id": 1,
+  "cyclic": true,
+  "warp_ends": 1,
+  "weft_picks": 5,
+  "max_float": 2,
+  "zones": [
+    {
+      "area": 4,
+      "cells": [
+        {"row": 0, "col": 0},
+        {"row": 1, "col": 0},
+        {"row": 3, "col": 0},
+        {"row": 4, "col": 0}
+      ],
+      "bbox": {
+        "min_row": 0,
+        "max_row": 4,
+        "min_col": 0,
+        "max_col": 0,
+        "height": 4,
+        "width": 1,
+        "crosses_weft_seam": true,
+        "crosses_warp_seam": false
+      },
+      "max_float_length": 4,
+      "directions": ["warp"]
+    }
+  ],
+  "total_zones": 1
+}
+```
+
+无违规设计返回空结果：
+
+```json
+{"design_id": 2, "cyclic": true, "warp_ends": 8, "weft_picks": 8,
+ "max_float": 2, "zones": [], "total_zones": 0}
+```
+
 ### 拒绝情形（HTTP 400，整份设计不入库）
 
 - 绑综矩阵非矩形（各行长度不一致）或含非 0/1 值；
@@ -612,6 +711,7 @@ python3 tests/test_api_threshold_profile.py  # threshold-profile 接口集成测
 python3 tests/test_api_compare.py            # compare 接口集成测试
 python3 tests/test_api_balance_hotspots.py   # balance-hotspots 接口集成测试
 python3 tests/test_api_loom_fit.py           # loom-fit 接口集成测试
+python3 tests/test_api_float_risk_zones.py   # float-risk-zones 接口集成测试
 ```
 
 接口测试使用临时 SQLite 文件与 FastAPI TestClient，不需要启动服务，也不会
@@ -640,6 +740,7 @@ tests/
   test_api_compare.py             # compare 接口集成测试（TestClient，临时库）
   test_api_balance_hotspots.py    # balance-hotspots 接口集成测试（TestClient，临时库）
   test_api_loom_fit.py            # loom-fit 接口集成测试（TestClient，临时库）
+  test_api_float_risk_zones.py    # float-risk-zones 接口集成测试（TestClient，临时库）
 Dockerfile
 docker-compose.yml
 requirements.txt

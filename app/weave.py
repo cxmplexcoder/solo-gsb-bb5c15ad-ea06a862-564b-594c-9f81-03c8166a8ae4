@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, asdict
 
 
@@ -423,6 +424,337 @@ def audit_floats(
     validate_design(threading, tie_up, treadling, max_float)
     matrix = build_interlacing(threading, tie_up, treadling)
     return matrix, violations_of_matrix(matrix, max_float, cyclic)
+
+
+@dataclass
+class RiskCell:
+    """落入某条超限浮长段的一个矩阵单元。"""
+
+    row: int           # 纬纱行号（0 ≤ row < weft_picks）
+    col: int           # 经纱列号（0 ≤ col < warp_ends）
+
+    def to_dict(self) -> dict:
+        return {"row": self.row, "col": self.col}
+
+
+@dataclass
+class RiskZone:
+    """经纬相邻规则下合并出的一个浮长风险连通区域。"""
+
+    cells: list[RiskCell]     # 区域单元，按 (row, col) 行主序
+    min_row: int              # 包围盒最小行（原始矩阵坐标）
+    max_row: int              # 包围盒最大行（原始矩阵坐标）
+    min_col: int              # 包围盒最小列（原始矩阵坐标）
+    max_col: int              # 包围盒最大列（原始矩阵坐标）
+    height: int               # 包围盒行数（跨接缝时为最小回绕覆盖行数）
+    width: int                # 包围盒列数（跨接缝时为最小回绕覆盖列数）
+    crosses_weft_seam: bool   # 区域是否跨越纬向接缝（首行/末行）
+    crosses_warp_seam: bool   # 区域是否跨越经向接缝（首列/末列）
+    max_float_length: int     # 区内各违规浮长段的最大长度
+    directions: list[str]     # 涉及方向，固定按 ["warp", "weft"] 去重排列
+
+    @property
+    def area(self) -> int:
+        """区域面积：包含的矩阵单元数。"""
+        return len(self.cells)
+
+    def to_dict(self) -> dict:
+        return {
+            "area": len(self.cells),
+            "cells": [c.to_dict() for c in self.cells],
+            "bbox": {
+                "min_row": self.min_row,
+                "max_row": self.max_row,
+                "min_col": self.min_col,
+                "max_col": self.max_col,
+                "height": self.height,
+                "width": self.width,
+                "crosses_weft_seam": self.crosses_weft_seam,
+                "crosses_warp_seam": self.crosses_warp_seam,
+            },
+            "max_float_length": self.max_float_length,
+            "directions": list(self.directions),
+        }
+
+
+class _Lift:
+    """给环面上一个连通分量的每个单元分配一致的整数提升坐标（单轴）。
+
+    带权并查集：off[x] = lift[x] - lift[parent[x]]；find 返回根与
+    lift[x] - lift[根]，find 过程递归压缩。约束 lift[v] - lift[u] = delta
+    时按集合大小合并。同一分量内约束必相容（邻接边都是格点图上的 ±1 步）。
+    """
+
+    def __init__(self, cells: set[tuple[int, int]]):
+        self.parent = {c: c for c in cells}
+        self.size = {c: 1 for c in cells}
+        self.off: dict[tuple[int, int], int] = {c: 0 for c in cells}
+
+    def find(self, x):
+        p = self.parent[x]
+        if p == x:
+            return x, 0
+        root, delta = self.find(p)  # delta = lift[p] - lift[root]
+        total = self.off[x] + delta
+        self.parent[x] = root
+        self.off[x] = total
+        return root, total
+
+    def unite(self, u, v, delta: int) -> None:
+        """加入约束 lift[v] - lift[u] = delta。"""
+        ru, ou = self.find(u)  # lift[u] = lift[ru] + ou
+        rv, ov = self.find(v)  # lift[v] = lift[rv] + ov
+        if ru == rv:
+            return
+        # 需要 lift[rv] - lift[ru] = delta + ou - ov
+        shift = delta + ou - ov
+        if self.size[ru] < self.size[rv]:
+            self.parent[ru] = rv
+            self.off[ru] = -shift
+            self.size[rv] += self.size[ru]
+        else:
+            self.parent[rv] = ru
+            self.off[rv] = shift
+            self.size[ru] += self.size[rv]
+
+    def lifts(self) -> dict[tuple[int, int], int]:
+        return {c: self.find(c)[1] for c in self.parent}
+
+
+def aggregate_float_risk_zones(
+    matrix: list[list[int]],
+    violations: list,
+    cyclic: bool,
+) -> list[RiskZone]:
+    """把超限经/纬浮长展开为矩阵单元，在经纬相邻规则下合并为连通区域。
+
+    输入：
+    - matrix：已存交织矩阵（仅取其尺寸；不重新审计）；
+    - violations：已存违规记录（FloatViolation 或同键 dict 均可），字段为
+      direction（"warp"/"weft"）、yarn_index（经纱列号或纬纱行号）、
+      start（连续段起点；循环合并段为尾部段起点，跨边界回绕展开）、length；
+    - cyclic：设计是否循环。为 true 时相邻关系在经纬两轴首尾相接（环面连通），
+      为 false 时边界不相连。
+
+    展开规则（长度可能超过矩阵尺寸的情况仅 cyclic 下出现）：
+    - warp 违规：列号 yarn_index，沿列从 start 起取 length 个单元，cyclic 时
+      行号取模回绕，因此跨边界的合并段会同时覆盖尾部与头部；
+    - weft 违规：行号 yarn_index，沿行同样从 start 起取 length 个单元。
+
+    连通规则：两个风险单元仅在上、下、左、右四个方向相邻时连通（对角相邻
+    不算）；经向违规单元与纬向违规单元相邻时也合并。同一单元可能被多条违规
+    覆盖（理论上不会，审计对每根纱只产生互不重叠的段），保留最大浮长并合并
+    涉及方向。
+
+    每区给出：单元坐标（行主序）、包围盒、面积（单元数）、最大浮长与涉及
+    方向。包围盒的 min/max 一律取**原始矩阵坐标**极值；height/width 是把
+    区域沿跨缝方向平移到普通平面上的**连续覆盖尺寸**（用带权并查集求单元
+    的一致整数提升坐标后的跨度，与遍历起点无关）：非跨缝区域即普通外接
+    矩形跨度；跨越接缝的区域（crosses_weft_seam/crosses_warp_seam 为 true）
+    其原始极值同时触及 0 与尺寸-1 两端，连续覆盖尺寸按回绕弧计；铺满整轴
+    时连续覆盖尺寸等于轴尺寸。
+
+    区域按严重度降序：(最大浮长, 面积) 降序，平局取最小单元坐标（行主序）
+    升序，保证输出稳定。
+    """
+    if not isinstance(cyclic, bool):
+        raise DesignError("cyclic must be a boolean")
+    if not matrix or not matrix[0] or any(
+        not isinstance(row, list) or len(row) != len(matrix[0]) for row in matrix
+    ):
+        raise DesignError("interlacing matrix must be a non-empty rectangular matrix")
+
+    picks = len(matrix)
+    ends = len(matrix[0])
+
+    def attr(v, name):
+        return v[name] if isinstance(v, dict) else getattr(v, name)
+
+    # (row, col) -> {"length": 覆盖该单元的最大浮长, "dirs": 涉及方向集合}
+    marked: dict[tuple[int, int], dict] = {}
+
+    def mark_cells(cells, direction):
+        for r, c, length in cells:
+            info = marked.get((r, c))
+            if info is None:
+                marked[(r, c)] = {"length": length, "dirs": {direction}}
+            else:
+                info["dirs"].add(direction)
+                if length > info["length"]:
+                    info["length"] = length
+
+    for v in violations:
+        direction = attr(v, "direction")
+        yarn = attr(v, "yarn_index")
+        start = attr(v, "start")
+        length = attr(v, "length")
+        for name, value in (
+            ("yarn_index", yarn), ("start", start), ("length", length)
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise DesignError(f"violation {name} must be an integer")
+        if length <= 0:
+            raise DesignError("violation length must be positive")
+        if direction == "warp":
+            if not 0 <= yarn < ends or not 0 <= start < picks:
+                raise DesignError("warp violation index out of matrix range")
+            if not cyclic and start + length > picks:
+                raise DesignError(
+                    "non-cyclic warp violation run exceeds matrix height"
+                )
+            cells = [
+                ((start + k) % picks if cyclic else (start + k), yarn, length)
+                for k in range(length)
+            ]
+        elif direction == "weft":
+            if not 0 <= yarn < picks or not 0 <= start < ends:
+                raise DesignError("weft violation index out of matrix range")
+            if not cyclic and start + length > ends:
+                raise DesignError(
+                    "non-cyclic weft violation run exceeds matrix width"
+                )
+            cells = [
+                (yarn, (start + k) % ends if cyclic else (start + k), length)
+                for k in range(length)
+            ]
+        else:
+            raise DesignError(
+                f"violation direction must be 'warp' or 'weft', got {direction!r}"
+            )
+        mark_cells(cells, direction)
+
+    # 连通分量在环面/平面上做洪水填充，同时收集分量内部的邻接边：
+    # - 行方向 DSU：纵向邻接 delta 1、横向邻接 delta 0（列坐标不变，
+    #   用于把转弯相连的平行纵向段锚定到同一提升坐标）；
+    # - 列方向 DSU：横向邻接 delta 1、纵向邻接 delta 0；
+    # - 接缝边（仅循环）固定按「末 -> 首 delta 1」方向记录，每个无向
+    #   邻接对只记一次。
+    visited: set[tuple[int, int]] = set()
+    zones: list[RiskZone] = []
+    for seed_r in range(picks):
+        for seed_c in range(ends):
+            if (seed_r, seed_c) not in marked or (seed_r, seed_c) in visited:
+                continue
+            visited.add((seed_r, seed_c))
+            members = {(seed_r, seed_c)}
+            # frozenset(邻接对) -> (u, v, delta)
+            row_edges: dict[frozenset, tuple] = {}
+            col_edges: dict[frozenset, tuple] = {}
+            dirs: set[str] = set()
+            max_float = 0
+            crosses_weft = False
+            crosses_warp = False
+            queue: deque[tuple[int, int]] = deque([(seed_r, seed_c)])
+            while queue:
+                r, c = queue.popleft()
+                info = marked[(r, c)]
+                dirs |= info["dirs"]
+                if info["length"] > max_float:
+                    max_float = info["length"]
+
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    if cyclic:
+                        if dr != 0:
+                            if picks == 1:
+                                continue
+                            nr, nc = (r + dr) % picks, c
+                            seam_pair = {r, nr} == {0, picks - 1}
+                        else:
+                            if ends == 1:
+                                continue
+                            nr, nc = r, (c + dc) % ends
+                            seam_pair = {c, nc} == {0, ends - 1}
+                    else:
+                        nr, nc = r + dr, c + dc
+                        if not (0 <= nr < picks and 0 <= nc < ends):
+                            continue
+                        seam_pair = False
+                    if (nr, nc) not in marked:
+                        continue
+
+                    key = frozenset(((r, c), (nr, nc)))
+                    if dr != 0:
+                        if seam_pair:
+                            crosses_weft = True
+                            oriented = ((picks - 1, c), (0, c), 1)
+                        else:
+                            lo, hi = min(r, nr), max(r, nr)
+                            oriented = ((lo, c), (hi, c), 1)
+                        row_edges.setdefault(key, oriented)
+                        # 纵向邻接不改变列提升坐标
+                        col_edges.setdefault(
+                            key, ((r, c), (nr, nc), 0)
+                        )
+                    else:
+                        if seam_pair:
+                            crosses_warp = True
+                            oriented = ((r, ends - 1), (r, 0), 1)
+                        else:
+                            lo, hi = min(c, nc), max(c, nc)
+                            oriented = ((r, lo), (r, hi), 1)
+                        col_edges.setdefault(key, oriented)
+                        # 横向邻接不改变行提升坐标
+                        row_edges.setdefault(
+                            key, ((r, c), (nr, nc), 0)
+                        )
+
+                    if (nr, nc) not in visited:
+                        visited.add((nr, nc))
+                        members.add((nr, nc))
+                        queue.append((nr, nc))
+
+            raw_cells = sorted(members)
+            min_row = min(r for r, _ in raw_cells)
+            max_row = max(r for r, _ in raw_cells)
+            min_col = min(c for _, c in raw_cells)
+            max_col = max(c for _, c in raw_cells)
+
+            if cyclic:
+                row_lift = _Lift(members)
+                col_lift = _Lift(members)
+                for u, v, delta in row_edges.values():
+                    row_lift.unite(u, v, delta)
+                for u, v, delta in col_edges.values():
+                    col_lift.unite(u, v, delta)
+                rl = row_lift.lifts()
+                cl = col_lift.lifts()
+                height = max(rl.values()) - min(rl.values()) + 1
+                width = max(cl.values()) - min(cl.values()) + 1
+                # 铺满整轴时接缝闭合边使整数提升再延伸一个周期，跨度
+                # 封顶为环长
+                if crosses_weft and height > picks:
+                    height = picks
+                if crosses_warp and width > ends:
+                    width = ends
+            else:
+                height = max_row - min_row + 1
+                width = max_col - min_col + 1
+
+            ordered_dirs = [d for d in ("warp", "weft") if d in dirs]
+            zones.append(
+                RiskZone(
+                    cells=[RiskCell(row=r, col=c) for r, c in raw_cells],
+                    min_row=min_row,
+                    max_row=max_row,
+                    min_col=min_col,
+                    max_col=max_col,
+                    height=height,
+                    width=width,
+                    crosses_weft_seam=crosses_weft,
+                    crosses_warp_seam=crosses_warp,
+                    max_float_length=max_float,
+                    directions=ordered_dirs,
+                )
+            )
+
+    zones.sort(
+        key=lambda z: (
+            -z.max_float_length,
+            -len(z.cells),
+            (z.cells[0].row, z.cells[0].col),
+        )
+    )
+    return zones
 
 
 def threshold_profile(

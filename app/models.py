@@ -164,6 +164,74 @@ class ErrorOut(BaseModel):
     detail: str
 
 
+class RiskCellOut(BaseModel):
+    """风险区域内的一个交织矩阵单元。"""
+
+    row: int = Field(..., description="单元所在纬纱行号")
+    col: int = Field(..., description="单元所在经纱列号")
+
+
+class RiskZoneBBoxOut(BaseModel):
+    """风险区域的包围盒（跨接缝时按回绕后的连续覆盖解释）。"""
+
+    min_row: int = Field(..., description="包围盒最小纬纱行号（原始矩阵坐标）")
+    max_row: int = Field(..., description="包围盒最大纬纱行号（原始矩阵坐标）")
+    min_col: int = Field(..., description="包围盒最小经纱列号（原始矩阵坐标）")
+    max_col: int = Field(..., description="包围盒最大经纱列号（原始矩阵坐标）")
+    height: int = Field(
+        ...,
+        description="连续覆盖行数：把区域平移到普通平面后的行跨度；"
+        "非跨纬向接缝时 = max_row-min_row+1，跨缝时按回绕弧计，"
+        "铺满整行方向时等于纬纱数",
+    )
+    width: int = Field(
+        ...,
+        description="连续覆盖列数：把区域平移到普通平面后的列跨度；"
+        "非跨经向接缝时 = max_col-min_col+1，跨缝时按回绕弧计，"
+        "铺满整列方向时等于经纱数",
+    )
+    crosses_weft_seam: bool = Field(
+        ..., description="区域是否跨越纬向接缝（首行与末行在循环意义上相连）"
+    )
+    crosses_warp_seam: bool = Field(
+        ..., description="区域是否跨越经向接缝（首列与末列在循环意义上相连）"
+    )
+
+
+class RiskZoneOut(BaseModel):
+    """一个浮长风险连通区域。"""
+
+    area: int = Field(..., description="区域面积：区域包含的矩阵单元数")
+    cells: list[RiskCellOut] = Field(
+        ..., description="区域单元坐标列表，按行、列升序（行主序）"
+    )
+    bbox: RiskZoneBBoxOut = Field(..., description="区域包围盒")
+    max_float_length: int = Field(
+        ..., description="区域内各条超限浮长段的最大浮长（严重度主排序键）"
+    )
+    directions: list[Literal["warp", "weft"]] = Field(
+        ...,
+        description="区域涉及的浮长方向，固定按 [warp, weft] 去重排列"
+        "（经向违规单元与纬向违规单元相邻时合并为同一区域）",
+    )
+
+
+class FloatRiskZonesOut(BaseModel):
+    """超限浮长风险区域聚合结果。"""
+
+    design_id: int = Field(..., description="被审计的设计 ID")
+    cyclic: bool = Field(..., description="区域连通沿用的设计循环声明")
+    warp_ends: int = Field(..., description="交织矩阵经纱数（列数）")
+    weft_picks: int = Field(..., description="交织矩阵纬纱数（行数）")
+    max_float: int = Field(..., description="设计入库时声明的最大浮长阈值")
+    zones: list[RiskZoneOut] = Field(
+        ...,
+        description="风险区域列表，按严重度降序：最大浮长、面积依次降序，"
+        "平局取区域最小单元坐标（行主序）升序；无违规时为空列表",
+    )
+    total_zones: int = Field(..., description="风险区域总数（zones 的长度）")
+
+
 class BalanceHotspotsIn(BaseModel):
     """局部交织均衡审计请求。"""
 
